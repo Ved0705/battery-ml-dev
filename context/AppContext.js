@@ -1,40 +1,60 @@
-import React, { createContext, useContext, useState, useCallback, useRef } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react';
+import { useAuth } from './AuthContext';
+import { getHistory } from '../backend/firebase/batteryService';
 
 const AppContext = createContext({});
 
-const generateReading = (prevHealth) => {
-  const variation = (Math.random() - 0.5) * 0.1; // small random walk
-  return {
-    id: Math.random().toString(36).substr(2, 9),
-    date: new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    health: Math.max(85, Math.min(100, (prevHealth || 92) + variation)),
-    voltage: 3.8 + Math.random() * 0.4,
-    current: 1.0 + Math.random() * 0.5,
-    temperature: 28 + Math.random() * 8, // 28 to 36 C
-  };
-};
-
 export function AppProvider({ children }) {
+  const { user } = useAuth();
   const [refreshRate, setRefreshRate] = useState(5000); // ms
   const [alertsEnabled, setAlertsEnabled] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [darkMode, setDarkMode] = useState(false);
   
-  // Start with one initial reading
-  const [history, setHistory] = useState([generateReading(92)]);
-  
-  const addReading = useCallback(() => {
-    setHistory(prev => {
-      const newReading = generateReading(prev.length > 0 ? prev[0].health : 92);
-      const newHistory = [newReading, ...prev];
-      // Keep only last 15 readings
-      if (newHistory.length > 15) {
-        newHistory.pop();
-      }
-      return newHistory;
-    });
-  }, []);
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  // Fetch from Firestore
+  const fetchReading = useCallback(async () => {
+    if (!user?.id) {
+      setLoading(false);
+      return;
+    }
+    try {
+      // For multi-user apps, link user ID directly to device ID, or create a pairing system. Here we use user.id directly.
+      const data = await getHistory(user.id, 15);
+      
+      const formattedData = data.map(item => {
+        const d = new Date(item.timestamp);
+        return {
+          id: item.id,
+          date: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+          time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          health: item.health,
+          risk: item.risk,
+          voltage: item.voltage,
+          current: item.current,
+          temperature: item.temperature,
+        };
+      });
+      setHistory(formattedData);
+    } catch (e) {
+      console.error('Error fetching battery data:', e);
+    } finally {
+      setLoading(false);
+    }
+  }, [user]);
+
+  // Provide a fallback function hook under the same name for backward compatibility
+  const addReading = fetchReading;
+
+  useEffect(() => {
+    if (autoRefresh && user?.id) {
+      fetchReading();
+      const interval = setInterval(fetchReading, refreshRate);
+      return () => clearInterval(interval);
+    }
+  }, [autoRefresh, user, refreshRate, fetchReading]);
 
   return (
     <AppContext.Provider value={{
@@ -42,7 +62,7 @@ export function AppProvider({ children }) {
       alertsEnabled, setAlertsEnabled,
       autoRefresh, setAutoRefresh,
       darkMode, setDarkMode,
-      history, addReading
+      history, addReading, loading
     }}>
       {children}
     </AppContext.Provider>
