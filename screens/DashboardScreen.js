@@ -1,48 +1,102 @@
-import React, { useMemo, useState } from 'react';
-import { SafeAreaView, StyleSheet, View } from 'react-native';
+import React, { useMemo, useState, useEffect } from 'react';
+import { SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
 import BatteryCard from '../components/BatteryCard';
 import Header from '../components/Header';
+import { useAppContext } from '../context/AppContext';
+import { useAuth } from '../context/AuthContext';
 
-const initialBatteryData = {
-  health: 92,
-  voltage: 3.98,
-  current: 1.25,
-  temperature: 31.4,
-};
+import { calculatePrediction } from '../utils/prediction';
+import PredictionCard from '../components/PredictionCard';
 
 const getRiskLevel = (temperature, health) => {
-  if (temperature >= 45 || health < 60) return 'High';
-  if (temperature >= 35 || health < 80) return 'Medium';
-  return 'Low';
+  if (temperature >= 45 || health < 60) return { label: 'High', color: '#DC2626' };
+  if (temperature >= 35 || health < 80) return { label: 'Medium', color: '#D97706' };
+  return { label: 'Low', color: '#16A34A' };
 };
 
-const formatValue = (value, unit, decimals = 0) => `${value.toFixed(decimals)} ${unit}`;
-
 export default function DashboardScreen() {
-  const [batteryData] = useState(initialBatteryData);
+  const { user } = useAuth();
+  const { refreshRate, autoRefresh, history, addReading } = useAppContext();
+  
+  // The first item in history is our current live reading
+  const currentData = history[0] || { health: 92, voltage: 3.98, current: 1.25, temperature: 31.4 };
+  const [time, setTime] = useState(new Date());
 
-  const riskLevel = useMemo(
-    () => getRiskLevel(batteryData.temperature, batteryData.health),
-    [batteryData]
+  useEffect(() => {
+    // Clock tick
+    const clockTimer = setInterval(() => setTime(new Date()), 1000);
+    
+    // Polling tick
+    let dataTimer;
+    if (autoRefresh) {
+      dataTimer = setInterval(() => {
+        addReading();
+      }, refreshRate);
+    }
+    
+    return () => {
+      clearInterval(clockTimer);
+      if (dataTimer) clearInterval(dataTimer);
+    };
+  }, [autoRefresh, refreshRate, addReading]);
+
+  const risk = useMemo(
+    () => getRiskLevel(currentData.temperature, currentData.health),
+    [currentData]
+  );
+  
+  const prediction = useMemo(
+    () => calculatePrediction(currentData, history),
+    [currentData, history]
   );
 
-  const riskColor = useMemo(() => {
-    if (riskLevel === 'High') return '#DC2626';
-    if (riskLevel === 'Medium') return '#EAB308';
-    return '#16A34A';
-  }, [riskLevel]);
+  const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.content}>
-        <Header title="Battery Health Monitor" subtitle="Live battery performance overview" />
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+      >
+        <Header
+          title={`Hello, ${user?.name || 'User'}`}
+          subtitle={`Last updated: ${timeStr}`}
+          statusDot={autoRefresh}
+        />
 
-        <BatteryCard title="Battery Health" value={formatValue(batteryData.health, '%')} />
-        <BatteryCard title="Voltage" value={formatValue(batteryData.voltage, 'V', 2)} />
-        <BatteryCard title="Current" value={formatValue(batteryData.current, 'A', 2)} />
-        <BatteryCard title="Temperature" value={formatValue(batteryData.temperature, '°C', 1)} />
-        <BatteryCard title="Risk Level" value={riskLevel} valueColor={riskColor} />
-      </View>
+        {/* AI Prediction Section */}
+        <PredictionCard prediction={prediction} />
+
+        <BatteryCard
+          title="Battery Health"
+          value={`${currentData.health.toFixed(1)}%`}
+          icon="battery-charging"
+          accentColor="#3B82F6"
+          subtitle="State of charge capacity"
+        />
+        <BatteryCard
+          title="Voltage"
+          value={`${currentData.voltage.toFixed(2)} V`}
+          icon="flash"
+          accentColor="#8B5CF6"
+          subtitle="Terminal voltage"
+        />
+        <BatteryCard
+          title="Current"
+          value={`${currentData.current.toFixed(2)} A`}
+          icon="swap-horizontal"
+          accentColor="#06B6D4"
+          subtitle="Discharge current"
+        />
+        <BatteryCard
+          title="Temperature"
+          value={`${currentData.temperature.toFixed(1)} °C`}
+          icon="thermometer"
+          accentColor={currentData.temperature >= 35 ? '#D97706' : '#16A34A'}
+          subtitle="Cell temperature"
+        />
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -50,14 +104,33 @@ export default function DashboardScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F5F7FA',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 20,
+    backgroundColor: '#F1F5F9',
+  },
+  scroll: {
+    flex: 1,
   },
   content: {
+    padding: 20,
+    paddingBottom: 32,
+  },
+  banner: {
     width: '100%',
-    maxWidth: 420,
+    borderRadius: 16,
+    borderWidth: 1.5,
+    paddingVertical: 14,
+    paddingHorizontal: 18,
+    marginBottom: 14,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
+  },
+  bannerLabel: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#334155',
+  },
+  bannerValue: {
+    fontSize: 20,
+    fontWeight: '800',
   },
 });
