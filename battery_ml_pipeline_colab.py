@@ -82,24 +82,32 @@ def generate_synthetic_battery_data(
     # Temperature (°C)
     temperature = rng.normal(loc=31, scale=9, size=n_samples).clip(-5, 70)
 
-    # Voltage degradation slope factors by type (lead-acid drops faster)
+    # Inject load switching spikes (roughly every 25 samples)
+    spike_mask = rng.integers(0, 25, size=n_samples) == 0
+    current[spike_mask] = current[spike_mask] * rng.uniform(1.5, 2.0, size=np.sum(spike_mask))
+    current = current.clip(1, 80)
+    temperature[spike_mask] = temperature[spike_mask] + rng.uniform(3, 5, size=np.sum(spike_mask))
+    temperature = temperature.clip(-5, 70)
+
+    # Voltage degradation slope factors by type
+    # lead_acid -> faster drop, li_ion -> stable but temp sensitive, lifepo4 -> very stable
     type_voltage_drop = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.00085, 0.00055, 0.00035],
-        default=0.00055,
+        [0.00150, 0.00040, 0.00010],
+        default=0.00040,
     )
 
-    # Temperature sensitivity (li-ion is most temperature sensitive)
+    # Temperature sensitivity (li-ion is highly temperature sensitive)
     temp_sensitivity = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.0040, 0.0070, 0.0025],
+        [0.0030, 0.0090, 0.0015],
         default=0.0045,
     )
 
     # Current sensitivity impacts instantaneous voltage sag
     current_sensitivity = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.018, 0.014, 0.010],
+        [0.025, 0.012, 0.008],
         default=0.014,
     )
 
@@ -150,52 +158,83 @@ def generate_synthetic_battery_data(
     df["voltage_drop_rate"] = (-(dv / dt)).fillna(0).clip(-0.1, 0.1)
     df["temp_change_rate"] = (dtemp / dt).fillna(0).clip(-1.0, 1.0)
 
-    # Label logic
-    # SOC: lower voltage + higher current => lower SOC
-    type_soc_offset = np.select(
-        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [-2.0, 2.0, 4.0],
-        default=0.0,
-    )
+    # New feature: current_spike
+    avg_current_per_battery = df.groupby("battery_id")["current"].transform("mean")
+    df["current_spike"] = (df["current"] / avg_current_per_battery).fillna(1.0)
 
-    soc = (
-        55
-        + 18 * (df["voltage"] - df["voltage"].mean()) / (df["voltage"].std() + 1e-6)
-        - 0.45 * df["current"]
-        - 120 * df["voltage_drop_rate"].clip(lower=0)
-        + type_soc_offset
-        + rng.normal(0, 4, size=n_samples)
+    # Label logic
+    # SOC: highly dependent on battery_type curves
+    # lead_acid: strongly linear voltage dependent
+    v_norm_lead = ((df["voltage"] - 11.8) / (12.6 - 11.8)).clip(0, 1)
+    soc_lead_acid = v_norm_lead * 100
+
+    # li_ion: smoother polynomial curve
+    v_norm_li = ((df["voltage"] - 3.0) / (4.2 - 3.0)).clip(0, 1)
+    soc_li_ion = np.power(v_norm_li, 0.8) * 100
+
+    # lifepo4: flat/stable curve in the middle, drops sharply at ends (sigmoid approximation)
+    v_norm_lfp = ((df["voltage"] - 2.8) / (3.65 - 2.8)).clip(0, 1)
+    soc_lifepo4 = (1 / (1 + np.exp(-15 * (v_norm_lfp - 0.5)))) * 100
+
+    soc = np.select(
+        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
+        [soc_lead_acid, soc_li_ion, soc_lifepo4],
+        default=soc_li_ion,
     )
+    
+    # Add small random noise
+    soc = soc + rng.normal(0, 2.0, size=n_samples)
     df["soc"] = soc.clip(0, 100)
 
     # SOH: decreases over time, faster under high temp/current and by chemistry
+    # lead_acid -> faster degradation with time and load
+    # li_ion -> highly sensitive to temperature
+    # lifepo4 -> slow degradation overall
     type_soh_time_penalty = np.select(
         [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.011, 0.009, 0.006],
-        default=0.009,
+        [0.015, 0.008, 0.003],
+        default=0.008,
     )
     type_temp_penalty = np.select(
         [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.10, 0.16, 0.07],
+        [0.08, 0.25, 0.05],
         default=0.10,
+    )
+    type_load_penalty = np.select(
+        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
+        [0.18, 0.08, 0.04],
+        default=0.08,
     )
 
     soh = (
         100
         - type_soh_time_penalty * df["time"]
         - type_temp_penalty * np.maximum(df["temperature"] - 30, 0)
-        - 0.12 * np.maximum(df["current"] - 20, 0)
+        - type_load_penalty * np.maximum(df["current"] - 20, 0)
         - 130 * df["voltage_drop_rate"].clip(lower=0)
         + rng.normal(0, 2.8, size=n_samples)
     )
     df["soh"] = soh.clip(0, 100)
 
-    # Risk label from SOC, SOH, temperature, and current stress
+    # Risk label from SOC, SOH, temperature, current stress, and real-time stress indicators
+    type_temp_risk = np.select(
+        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
+        [0.10, 0.30, 0.05],
+        default=0.15,
+    )
+    type_vdrop_risk = np.select(
+        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
+        [200, 100, 50],
+        default=100,
+    )
+
     risk_score = (
-        0.45 * (100 - df["soc"])
-        + 0.35 * (100 - df["soh"])
-        + 0.12 * np.maximum(df["temperature"] - 40, 0)
-        + 0.08 * np.maximum(df["current"] - 50, 0)
+        0.30 * (100 - df["soc"])
+        + 0.25 * (100 - df["soh"])
+        + type_temp_risk * np.maximum(df["temperature"] - 40, 0)
+        + 0.10 * np.maximum(df["current"] - 50, 0)
+        + type_vdrop_risk * df["voltage_drop_rate"].clip(lower=0)
+        + 10 * df["temp_change_rate"].clip(lower=0)
     )
 
     df["risk"] = pd.cut(
@@ -218,6 +257,7 @@ def build_preprocessor() -> ColumnTransformer:
         "power",
         "voltage_drop_rate",
         "temp_change_rate",
+        "current_spike",
     ]
 
     return ColumnTransformer(
@@ -246,6 +286,7 @@ def main() -> None:
         "power",
         "voltage_drop_rate",
         "temp_change_rate",
+        "current_spike",
     ]
 
     X = df[feature_cols]
