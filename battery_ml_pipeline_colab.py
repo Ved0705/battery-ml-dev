@@ -1,4 +1,15 @@
 """
+
+Train battery health models from a synthetic CSV dataset.
+
+Expected input file:
+  - battery_dataset.csv
+
+Saves:
+  - soc_model.pkl
+  - soh_model.pkl
+  - risk_model.pkl
+
 Battery Health Monitoring ML Pipeline (Google Colab friendly)
 
 This script:
@@ -11,9 +22,66 @@ This script:
 Run in Google Colab:
 !pip install -q pandas numpy scikit-learn joblib
 !python battery_ml_pipeline_colab.py
+
 """
 
 from __future__ import annotations
+
+
+from pathlib import Path
+
+import pandas as pd
+from joblib import dump
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from xgboost import XGBClassifier
+
+RANDOM_STATE = 42
+DATASET_PATH = Path("battery_dataset.csv")
+
+
+RISK_MAP = {"Low": 0, "Medium": 1, "High": 2}
+
+
+def load_dataset(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {path}")
+    df = pd.read_csv(path)
+    required_columns = {
+        "voltage",
+        "current",
+        "temperature",
+        "time",
+        "battery_type",
+        "power",
+        "voltage_drop_rate",
+        "temp_change_rate",
+        "current_spike",
+        "soc",
+        "soh",
+        "risk",
+    }
+    missing = sorted(required_columns - set(df.columns))
+    if missing:
+        raise ValueError(f"Dataset missing required columns: {missing}")
+    return df
+
+
+def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    result["thermal_stress"] = result["temperature"] * result["temp_change_rate"]
+    result["electrical_stress"] = result["current"] * result["voltage_drop_rate"]
+    result["degradation_index"] = result["time"] * result["voltage_drop_rate"]
+    return result
+
+
+def build_preprocessor() -> ColumnTransformer:
+    categorical = ["battery_type"]
+    numeric = [
 
 import numpy as np
 import pandas as pd
@@ -82,32 +150,24 @@ def generate_synthetic_battery_data(
     # Temperature (°C)
     temperature = rng.normal(loc=31, scale=9, size=n_samples).clip(-5, 70)
 
-    # Inject load switching spikes (roughly every 25 samples)
-    spike_mask = rng.integers(0, 25, size=n_samples) == 0
-    current[spike_mask] = current[spike_mask] * rng.uniform(1.5, 2.0, size=np.sum(spike_mask))
-    current = current.clip(1, 80)
-    temperature[spike_mask] = temperature[spike_mask] + rng.uniform(3, 5, size=np.sum(spike_mask))
-    temperature = temperature.clip(-5, 70)
-
-    # Voltage degradation slope factors by type
-    # lead_acid -> faster drop, li_ion -> stable but temp sensitive, lifepo4 -> very stable
+    # Voltage degradation slope factors by type (lead-acid drops faster)
     type_voltage_drop = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.00150, 0.00040, 0.00010],
-        default=0.00040,
+        [0.00085, 0.00055, 0.00035],
+        default=0.00055,
     )
 
-    # Temperature sensitivity (li-ion is highly temperature sensitive)
+    # Temperature sensitivity (li-ion is most temperature sensitive)
     temp_sensitivity = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.0030, 0.0090, 0.0015],
+        [0.0040, 0.0070, 0.0025],
         default=0.0045,
     )
 
     # Current sensitivity impacts instantaneous voltage sag
     current_sensitivity = np.select(
         [battery_type == "lead_acid", battery_type == "li_ion", battery_type == "lifepo4"],
-        [0.025, 0.012, 0.008],
+        [0.018, 0.014, 0.010],
         default=0.014,
     )
 
@@ -158,83 +218,52 @@ def generate_synthetic_battery_data(
     df["voltage_drop_rate"] = (-(dv / dt)).fillna(0).clip(-0.1, 0.1)
     df["temp_change_rate"] = (dtemp / dt).fillna(0).clip(-1.0, 1.0)
 
-    # New feature: current_spike
-    avg_current_per_battery = df.groupby("battery_id")["current"].transform("mean")
-    df["current_spike"] = (df["current"] / avg_current_per_battery).fillna(1.0)
-
     # Label logic
-    # SOC: highly dependent on battery_type curves
-    # lead_acid: strongly linear voltage dependent
-    v_norm_lead = ((df["voltage"] - 11.8) / (12.6 - 11.8)).clip(0, 1)
-    soc_lead_acid = v_norm_lead * 100
-
-    # li_ion: smoother polynomial curve
-    v_norm_li = ((df["voltage"] - 3.0) / (4.2 - 3.0)).clip(0, 1)
-    soc_li_ion = np.power(v_norm_li, 0.8) * 100
-
-    # lifepo4: flat/stable curve in the middle, drops sharply at ends (sigmoid approximation)
-    v_norm_lfp = ((df["voltage"] - 2.8) / (3.65 - 2.8)).clip(0, 1)
-    soc_lifepo4 = (1 / (1 + np.exp(-15 * (v_norm_lfp - 0.5)))) * 100
-
-    soc = np.select(
+    # SOC: lower voltage + higher current => lower SOC
+    type_soc_offset = np.select(
         [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [soc_lead_acid, soc_li_ion, soc_lifepo4],
-        default=soc_li_ion,
+        [-2.0, 2.0, 4.0],
+        default=0.0,
     )
-    
-    # Add small random noise
-    soc = soc + rng.normal(0, 2.0, size=n_samples)
+
+    soc = (
+        55
+        + 18 * (df["voltage"] - df["voltage"].mean()) / (df["voltage"].std() + 1e-6)
+        - 0.45 * df["current"]
+        - 120 * df["voltage_drop_rate"].clip(lower=0)
+        + type_soc_offset
+        + rng.normal(0, 4, size=n_samples)
+    )
     df["soc"] = soc.clip(0, 100)
 
     # SOH: decreases over time, faster under high temp/current and by chemistry
-    # lead_acid -> faster degradation with time and load
-    # li_ion -> highly sensitive to temperature
-    # lifepo4 -> slow degradation overall
     type_soh_time_penalty = np.select(
         [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.015, 0.008, 0.003],
-        default=0.008,
+        [0.011, 0.009, 0.006],
+        default=0.009,
     )
     type_temp_penalty = np.select(
         [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.08, 0.25, 0.05],
+        [0.10, 0.16, 0.07],
         default=0.10,
-    )
-    type_load_penalty = np.select(
-        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.18, 0.08, 0.04],
-        default=0.08,
     )
 
     soh = (
         100
         - type_soh_time_penalty * df["time"]
         - type_temp_penalty * np.maximum(df["temperature"] - 30, 0)
-        - type_load_penalty * np.maximum(df["current"] - 20, 0)
+        - 0.12 * np.maximum(df["current"] - 20, 0)
         - 130 * df["voltage_drop_rate"].clip(lower=0)
         + rng.normal(0, 2.8, size=n_samples)
     )
     df["soh"] = soh.clip(0, 100)
 
-    # Risk label from SOC, SOH, temperature, current stress, and real-time stress indicators
-    type_temp_risk = np.select(
-        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [0.10, 0.30, 0.05],
-        default=0.15,
-    )
-    type_vdrop_risk = np.select(
-        [df["battery_type"] == "lead_acid", df["battery_type"] == "li_ion", df["battery_type"] == "lifepo4"],
-        [200, 100, 50],
-        default=100,
-    )
-
+    # Risk label from SOC, SOH, temperature, and current stress
     risk_score = (
-        0.30 * (100 - df["soc"])
-        + 0.25 * (100 - df["soh"])
-        + type_temp_risk * np.maximum(df["temperature"] - 40, 0)
-        + 0.10 * np.maximum(df["current"] - 50, 0)
-        + type_vdrop_risk * df["voltage_drop_rate"].clip(lower=0)
-        + 10 * df["temp_change_rate"].clip(lower=0)
+        0.45 * (100 - df["soc"])
+        + 0.35 * (100 - df["soh"])
+        + 0.12 * np.maximum(df["temperature"] - 40, 0)
+        + 0.08 * np.maximum(df["current"] - 50, 0)
     )
 
     df["risk"] = pd.cut(
@@ -250,6 +279,7 @@ def generate_synthetic_battery_data(
 def build_preprocessor() -> ColumnTransformer:
     categorical_features = ["battery_type"]
     numeric_features = [
+
         "voltage",
         "current",
         "temperature",
@@ -257,7 +287,17 @@ def build_preprocessor() -> ColumnTransformer:
         "power",
         "voltage_drop_rate",
         "temp_change_rate",
+
         "current_spike",
+        "thermal_stress",
+        "electrical_stress",
+        "degradation_index",
+    ]
+    return ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(handle_unknown="ignore"), categorical),
+            ("num", "passthrough", numeric),
+
     ]
 
     return ColumnTransformer(
@@ -273,11 +313,18 @@ def build_preprocessor() -> ColumnTransformer:
 
 
 def main() -> None:
+
+    df = load_dataset(DATASET_PATH)
+    df = engineer_features(df)
+
+    feature_columns = [
+
     print("Generating synthetic dataset...")
     df = generate_synthetic_battery_data()
 
     # Keep only requested feature columns + derived features for modeling
     feature_cols = [
+
         "voltage",
         "current",
         "temperature",
@@ -287,6 +334,29 @@ def main() -> None:
         "voltage_drop_rate",
         "temp_change_rate",
         "current_spike",
+        "thermal_stress",
+        "electrical_stress",
+        "degradation_index",
+    ]
+
+    X = df[feature_columns]
+    y_soc = df["soc"]
+    y_soh = df["soh"]
+    y_risk = df["risk"].map(RISK_MAP)
+
+    if y_risk.isna().any():
+        raise ValueError("Risk column contains values outside {Low, Medium, High}")
+
+    (
+        X_train,
+        X_test,
+        y_soc_train,
+        y_soc_test,
+        y_soh_train,
+        y_soh_test,
+        y_risk_train,
+        y_risk_test,
+    ) = train_test_split(
     ]
 
     X = df[feature_cols]
@@ -296,6 +366,7 @@ def main() -> None:
 
     # Train/test split shared across all tasks
     X_train, X_test, y_soc_train, y_soc_test, y_soh_train, y_soh_test, y_risk_train, y_risk_test = train_test_split(
+
         X,
         y_soc,
         y_soh,
@@ -342,6 +413,37 @@ def main() -> None:
             ("preprocessor", preprocessor),
             (
                 "model",
+                XGBClassifier(
+                    n_estimators=300,
+                    max_depth=6,
+                    learning_rate=0.05,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    objective="multi:softprob",
+                    num_class=3,
+                    eval_metric="mlogloss",
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    soc_model.fit(X_train, y_soc_train)
+    soh_model.fit(X_train, y_soh_train)
+    risk_model.fit(X_train, y_risk_train)
+
+    soc_pred = soc_model.predict(X_test)
+    soh_pred = soh_model.predict(X_test)
+    risk_pred = risk_model.predict(X_test)
+
+    print(f"SOC R2 score: {r2_score(y_soc_test, soc_pred):.4f}")
+    print(f"SOH R2 score: {r2_score(y_soh_test, soh_pred):.4f}")
+    print(f"Risk accuracy: {accuracy_score(y_risk_test, risk_pred):.4f}")
+    print("Classification report:")
+    print(classification_report(y_risk_test, risk_pred, target_names=["Low", "Medium", "High"], digits=4))
+    print("Confusion matrix:")
+    print(confusion_matrix(y_risk_test, risk_pred))
                 RandomForestClassifier(
                     n_estimators=300,
                     random_state=RANDOM_STATE,
@@ -392,9 +494,7 @@ def main() -> None:
     dump(soc_model, "soc_model.pkl")
     dump(soh_model, "soh_model.pkl")
     dump(risk_model, "risk_model.pkl")
-
     print("Saved models: soc_model.pkl, soh_model.pkl, risk_model.pkl")
-
 
 if __name__ == "__main__":
     main()
