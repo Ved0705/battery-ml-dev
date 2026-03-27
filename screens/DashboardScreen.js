@@ -1,11 +1,11 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView, ScrollView, StyleSheet, Text, View, TouchableOpacity } from 'react-native';
 import BatteryCard from '../components/BatteryCard';
 import Header from '../components/Header';
 import { useAppContext } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 
-import { calculatePrediction } from '../utils/prediction';
+import { getBatteryPrediction } from '../utils/api';
 import PredictionCard from '../components/PredictionCard';
 
 const getRiskLevel = (temperature, health) => {
@@ -45,10 +45,38 @@ export default function DashboardScreen() {
     [currentData]
   );
   
-  const prediction = useMemo(
-    () => calculatePrediction(currentData, history),
-    [currentData, history]
-  );
+  const [prediction, setPrediction] = useState(null);
+  const [isPredicting, setIsPredicting] = useState(false);
+  const [predictError, setPredictError] = useState('');
+
+  const handlePredict = async () => {
+    setIsPredicting(true);
+    setPredictError('');
+    try {
+      const prevData = history[1] || currentData;
+      const v_drop = prevData.voltage - currentData.voltage;
+      const t_change = currentData.temperature - prevData.temperature;
+
+      const reqData = {
+        voltage: currentData.voltage || 0,
+        current: currentData.current || 0,
+        temperature: currentData.temperature || 0,
+        time: history.length * 10,
+        battery_type: "Li-ion",
+        power: (currentData.voltage || 0) * (currentData.current || 0),
+        voltage_drop_rate: v_drop > 0 ? v_drop : 0,
+        temp_change_rate: t_change || 0,
+        current_spike: prevData.current ? currentData.current / prevData.current : 1
+      };
+
+      const result = await getBatteryPrediction(reqData);
+      setPrediction(result);
+    } catch (err) {
+      setPredictError(err.message || 'API Failed');
+    } finally {
+      setIsPredicting(false);
+    }
+  };
 
   const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
@@ -66,7 +94,19 @@ export default function DashboardScreen() {
         />
 
         {/* AI Prediction Section */}
-        <PredictionCard prediction={prediction} />
+        <View style={styles.predictSection}>
+          <TouchableOpacity 
+            style={[styles.predictButton, isPredicting && styles.predictButtonDisabled]} 
+            onPress={handlePredict} 
+            disabled={isPredicting}
+          >
+            <Text style={styles.predictButtonText}>
+              {isPredicting ? "Predicting..." : "Get AI Prediction"}
+            </Text>
+          </TouchableOpacity>
+          {predictError ? <Text style={styles.errorText}>{predictError}</Text> : null}
+          <PredictionCard prediction={prediction} />
+        </View>
 
         <BatteryCard
           title="Battery Health"
@@ -112,6 +152,38 @@ const styles = StyleSheet.create({
   content: {
     padding: 20,
     paddingBottom: 32,
+  },
+  predictSection: {
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  predictButton: {
+    backgroundColor: '#8B5CF6',
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    width: '100%',
+    alignItems: 'center',
+    shadowColor: '#8B5CF6',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  predictButtonDisabled: {
+    backgroundColor: '#A78BFA',
+  },
+  predictButtonText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 16,
+    letterSpacing: 0.5,
+  },
+  errorText: {
+    color: '#DC2626',
+    marginTop: 8,
+    fontSize: 14,
+    fontWeight: '600'
   },
   banner: {
     width: '100%',

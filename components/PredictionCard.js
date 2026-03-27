@@ -5,27 +5,40 @@ import { Ionicons } from '@expo/vector-icons';
 export default function PredictionCard({ prediction }) {
   if (!prediction) return null;
 
+  const getRiskColor = (risk) => {
+    switch(risk) {
+      case 'Low': return '#16A34A';
+      case 'Medium': return '#D97706';
+      case 'High': return '#DC2626';
+      default: return '#64748B';
+    }
+  };
+
   return (
     <View style={styles.card}>
       <View style={styles.header}>
         <Ionicons name="sparkles" size={20} color="#8B5CF6" />
-        <Text style={styles.headerTitle}>AI Prediction</Text>
+        <Text style={styles.headerTitle}>AI Forecast Results</Text>
       </View>
 
       <View style={styles.grid}>
         <View style={styles.gridItem}>
-          <Text style={styles.label}>Est. Battery Life</Text>
-          <Text style={styles.valueHighlight}>{prediction.remainingHours} hrs</Text>
+          <Text style={styles.label}>Est. Time to Failure</Text>
+          <Text style={styles.valueHighlight}>{prediction.time_to_failure.toFixed(1)} hrs</Text>
         </View>
 
         <View style={styles.gridItem}>
-          <Text style={styles.label}>Health Trend</Text>
-          <Text style={[styles.value, { color: prediction.trendColor }]}>{prediction.trend}</Text>
+          <Text style={styles.label}>Risk Forecast</Text>
+          <Text style={[styles.valueHighlight, { color: getRiskColor(prediction.risk) }]}>{prediction.risk}</Text>
         </View>
 
-        <View style={[styles.gridItem, styles.fullWidth]}>
-          <Text style={styles.label}>Risk Forecast</Text>
-          <Text style={[styles.value, { color: prediction.riskColor }]}>{prediction.riskForecast}</Text>
+        <View style={styles.gridItem}>
+          <Text style={styles.label}>Predicted SOC</Text>
+          <Text style={styles.value}>{prediction.soc.toFixed(1)}%</Text>
+        </View>
+        <View style={styles.gridItem}>
+          <Text style={styles.label}>Predicted SOH</Text>
+          <Text style={styles.value}>{prediction.soh.toFixed(1)}%</Text>
         </View>
       </View>
     </View>
@@ -37,9 +50,9 @@ const styles = StyleSheet.create({
     width: '100%',
     backgroundColor: '#F8FAFC', // slightly different background
     borderRadius: 16,
-    paddingVertical: 18,
     paddingHorizontal: 18,
-    marginBottom: 16,
+    marginTop: 16,
+    marginBottom: 6,
     borderWidth: 1.5,
     borderColor: '#E2E8F0',
     shadowColor: '#8B5CF6',
@@ -81,7 +94,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#64748B',
     fontWeight: '600',
-    marginBottom: 4,
+    marginBottom: 6,
     textTransform: 'uppercase',
   },
   valueHighlight: {
